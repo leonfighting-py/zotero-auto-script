@@ -1,0 +1,4 @@
+pyzotero==1.5.18
+habanero==1.2.6
+bibtexparser==1.4.1
+python-dotenv>=1.1.0,<2
