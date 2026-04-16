@@ -1,49 +1,27 @@
 from __future__ import annotations
 
-import os, re, sys, time
-from dataclasses import dataclass
-from datetime import datetime
+import os
 from pathlib import Path
-from typing import Any
 
-import bibtexparser
-from bibtexparser.bparser import BibTexParser
 from dotenv import load_dotenv
-from habanero import Crossref
-from pyzotero import zotero
 
-REVIEW_PREFIX = "⚠️ [需手动检查] "
-REVIEW_NOTE = "原始信息来自 AI；Crossref 未能可靠校验，请手动核查标题、作者、期刊、年份与 DOI。"
-ANSI = {"green": "\033[92m", "yellow": "\033[93m", "red": "\033[91m", "blue": "\033[94m", "reset": "\033[0m"}
-
-
-@dataclass
-class Config:
-    zotero_library_id: str
-    zotero_library_type: str
-    zotero_api_key: str
-    crossref_mailto: str
-    crossref_score_threshold: float
-    input_bib: Path
-    collection_prefix: str
-    request_delay_seconds: float
+from citation_pipeline.claims_loader import load_claims_from_file
+from citation_pipeline.common.config import RetrievalConfig, VerificationConfig
+from citation_pipeline.common.models import ReviewFeedbackRecord
+from citation_pipeline.exporters.zotero_importer import ZoteroImporter, ZoteroImportError
+from citation_pipeline.full_pipeline import FullCitationPipeline
+from citation_pipeline.retrieval import QueryBuilder, RetrievalPipeline, SemanticScholarClient
+from citation_pipeline.review_logger import ReviewFeedbackLogger, ReviewLogger
+from citation_pipeline.verification.bibtex_parser import VerificationError
+from citation_pipeline.verification.crossref_verifier import CrossrefVerifier
+from citation_pipeline.verification.pipeline import VerificationPipeline
 
 
 class FatalError(Exception):
     pass
 
 
-def c(msg: str, color: str) -> str:
-    return msg if not sys.stdout.isatty() else f"{ANSI[color]}{msg}{ANSI['reset']}"
-
-
-def info(msg: str) -> None: print(c(f"[信息] {msg}", "blue"))
-def ok(msg: str) -> None: print(c(f"[成功] {msg}", "green"))
-def warn(msg: str) -> None: print(c(f"[警告] {msg}", "yellow"))
-def err(msg: str) -> None: print(c(f"[错误] {msg}", "red"))
-
-
-def load_config() -> Config:
+def load_verification_config() -> VerificationConfig:
     load_dotenv()
     library_id = os.getenv("ZOTERO_LIBRARY_ID", "").strip()
     library_type = os.getenv("ZOTERO_LIBRARY_TYPE", "user").strip() or "user"
@@ -53,7 +31,8 @@ def load_config() -> Config:
     input_bib = os.getenv("INPUT_BIB", "reference.bib").strip() or "reference.bib"
     prefix = os.getenv("COLLECTION_PREFIX", "Paper_Refs").strip() or "Paper_Refs"
     delay_raw = os.getenv("REQUEST_DELAY_SECONDS", "0.3").strip() or "0.3"
-    missing = []
+
+    missing: list[str] = []
     if not library_id:
         missing.append("ZOTERO_LIBRARY_ID")
     if not api_key:
@@ -64,283 +43,173 @@ def load_config() -> Config:
         raise FatalError(f"缺少必要配置：{', '.join(missing)}。请先填写 .env 文件。")
     if library_type not in {"user", "group"}:
         raise FatalError("ZOTERO_LIBRARY_TYPE 只能是 user 或 group。")
+
     try:
         threshold = float(threshold_raw)
         delay = float(delay_raw)
     except ValueError as exc:
         raise FatalError("CROSSREF_SCORE_THRESHOLD / REQUEST_DELAY_SECONDS 必须是数字。") from exc
-    return Config(library_id, library_type, api_key, crossref_mailto, threshold, Path(input_bib), prefix, delay)
+
+    return VerificationConfig(
+        zotero_library_id=library_id,
+        zotero_library_type=library_type,
+        zotero_api_key=api_key,
+        crossref_mailto=crossref_mailto,
+        crossref_score_threshold=threshold,
+        input_bib=Path(input_bib),
+        collection_prefix=prefix,
+        request_delay_seconds=delay,
+    )
 
 
-def clean(v: str) -> str:
-    return re.sub(r"\s+", " ", (v or "").replace("{", "").replace("}", "")).strip()
+def load_retrieval_config() -> RetrievalConfig:
+    load_dotenv()
+    timeout_raw = os.getenv("SEMANTIC_SCHOLAR_TIMEOUT_SECONDS", "20").strip() or "20"
+    top_k_raw = os.getenv("SEMANTIC_SCHOLAR_TOP_K", "5").strip() or "5"
+    log_path = os.getenv("REVIEW_LOG_PATH", "review_logs/full_pipeline_reviews.jsonl").strip() or "review_logs/full_pipeline_reviews.jsonl"
+    feedback_path = os.getenv("REVIEW_FEEDBACK_PATH", "review_logs/full_pipeline_feedback.jsonl").strip() or "review_logs/full_pipeline_feedback.jsonl"
+    claims_input_path = os.getenv("CLAIMS_INPUT_PATH", "claims.txt").strip() or "claims.txt"
 
-
-def first_author(author_field: str) -> str:
-    s = clean(author_field)
-    if not s:
-        return ""
-    first = s.split(" and ")[0].strip()
-    return first.split(",", 1)[0].strip() if "," in first else (first.split()[-1] if first.split() else "")
-
-
-def parse_authors(author_field: str) -> list[dict[str, str]]:
-    s = clean(author_field)
-    if not s:
-        return []
-    out = []
-    for raw in s.split(" and "):
-        raw = raw.strip()
-        if not raw:
-            continue
-        if "," in raw:
-            last, first = [x.strip() for x in raw.split(",", 1)]
-        else:
-            parts = raw.split()
-            first, last = (" ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else ("", raw)
-        out.append({"creatorType": "author", "firstName": first, "lastName": last})
-    return out
-
-
-def parse_refs(bib_path: Path) -> list[dict[str, Any]]:
-    if not bib_path.exists():
-        raise FatalError(f"输入文件不存在：{bib_path}")
-    if bib_path.stat().st_size == 0:
-        raise FatalError(f"输入文件为空：{bib_path}")
     try:
-        with bib_path.open("r", encoding="utf-8") as f:
-            parser = BibTexParser(common_strings=True)
-            parser.ignore_nonstandard_types = False
-            db = bibtexparser.load(f, parser=parser)
-    except Exception as exc:
-        raise FatalError(f"BibTeX 解析失败：{exc}") from exc
-    if not db.entries:
-        raise FatalError(".bib 文件中未解析到任何条目。")
-    refs = []
-    for i, e in enumerate(db.entries, start=1):
-        author_raw = clean(e.get("author", ""))
-        refs.append({
-            "order": i,
-            "entry_key": clean(e.get("ID", "")),
-            "title": clean(e.get("title", "")),
-            "author": first_author(author_raw),
-            "author_raw": author_raw,
-            "year": clean(e.get("year", "")),
-            "journal": clean(e.get("journal", "") or e.get("journaltitle", "")),
-            "doi": clean(e.get("doi", "")),
-            "corrected_doi": "",
-            "needs_review": False,
-            "match_score": None,
-            "crossref_title": "",
-            "crossref_authors": [],
-            "crossref_journal": "",
-            "crossref_year": "",
-        })
-    return refs
+        timeout = float(timeout_raw)
+        top_k = int(top_k_raw)
+    except ValueError as exc:
+        raise FatalError("SEMANTIC_SCHOLAR_TIMEOUT_SECONDS / SEMANTIC_SCHOLAR_TOP_K 格式错误。") from exc
+
+    return RetrievalConfig(
+        semantic_scholar_api_key=os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip(),
+        semantic_scholar_base_url=os.getenv("SEMANTIC_SCHOLAR_BASE_URL", "https://api.semanticscholar.org/graph/v1").strip() or "https://api.semanticscholar.org/graph/v1",
+        semantic_scholar_timeout_seconds=timeout,
+        semantic_scholar_top_k=top_k,
+        review_log_path=Path(log_path),
+        review_feedback_path=Path(feedback_path),
+        claims_input_path=Path(claims_input_path),
+    )
 
 
-def with_retry(func, config: Config, desc: str) -> Any:
-    last = None
-    for attempt in range(1, 4):
-        try:
-            result = func()
-            time.sleep(config.request_delay_seconds)
-            return result
-        except Exception as exc:
-            last = exc
-            status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code == 429 and attempt < 3:
-                wait = attempt * 2
-                warn(f"{desc} 被限流，第 {attempt} 次重试前等待 {wait} 秒。")
-                time.sleep(wait)
-                continue
-            if attempt < 3:
-                warn(f"{desc} 失败，第 {attempt} 次重试中：{exc}")
-                time.sleep(1.5 * attempt)
-                continue
-            raise
-    raise last or RuntimeError("未知请求错误")
-
-
-def xref_meta(item: dict[str, Any]) -> dict[str, Any]:
-    published = item.get("published-print") or item.get("published-online") or item.get("issued") or {}
-    date_parts = published.get("date-parts") or []
-    year = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
-    authors = [
-        {
-            "creatorType": "author",
-            "firstName": a.get("given", "") or "",
-            "lastName": a.get("family", "") or a.get("name", "") or "",
-        }
-        for a in (item.get("author") or [])
-    ]
-    return {
-        "title": clean((item.get("title") or [""])[0]),
-        "authors": authors,
-        "journal": clean((item.get("container-title") or [""])[0]),
-        "year": year,
-        "doi": clean(item.get("DOI", "")),
-        "score": item.get("score"),
-    }
-
-
-def validate_doi(ref: dict[str, Any], cr: Crossref, config: Config):
-    if not ref["doi"]:
-        return None
-    try:
-        resp = with_retry(lambda: cr.works(ids=ref["doi"]), config, f"DOI 校验 {ref['doi']}")
-    except Exception as exc:
-        warn(f"第 {ref['order']} 篇 DOI 校验失败：{exc}")
-        return None
-    msg = resp.get("message") if isinstance(resp, dict) else None
-    return xref_meta(msg) if msg else None
-
-
-def search_crossref(ref: dict[str, Any], cr: Crossref, config: Config):
-    query = " ".join(x for x in [ref["title"], ref["author"], ref["year"]] if x)
-    try:
-        resp = with_retry(lambda: cr.works(query_bibliographic=query, limit=1), config, f"Crossref 模糊搜索：{ref['title']}")
-    except Exception as exc:
-        warn(f"第 {ref['order']} 篇模糊搜索失败：{exc}")
-        return None
-    items = ((resp or {}).get("message") or {}).get("items") or []
-    return xref_meta(items[0]) if items else None
-
-
-def validate_and_correct(refs: list[dict[str, Any]], config: Config) -> list[dict[str, Any]]:
-    cr = Crossref(mailto=config.crossref_mailto)
-    total = len(refs)
-    for ref in refs:
-        info(f"校验进度 {ref['order']}/{total}：{ref['title'] or '[无标题]'}")
-        meta = validate_doi(ref, cr, config)
-        if meta:
-            ref.update({
-                "corrected_doi": meta["doi"] or ref["doi"],
-                "crossref_title": meta["title"],
-                "crossref_authors": meta["authors"],
-                "crossref_journal": meta["journal"],
-                "crossref_year": meta["year"],
-                "match_score": meta["score"],
-            })
-            ok(f"第 {ref['order']} 篇 DOI 校验成功：{ref['corrected_doi']}")
-            continue
-        meta = search_crossref(ref, cr, config)
-        if meta and meta["doi"] and (meta["score"] or 0) >= config.crossref_score_threshold:
-            ref.update({
-                "corrected_doi": meta["doi"],
-                "crossref_title": meta["title"],
-                "crossref_authors": meta["authors"],
-                "crossref_journal": meta["journal"],
-                "crossref_year": meta["year"],
-                "match_score": meta["score"],
-            })
-            ok(f"第 {ref['order']} 篇模糊匹配成功：score={meta['score']}, DOI={meta['doi']}")
-            continue
-        ref["needs_review"] = True
-        ref["match_score"] = meta["score"] if meta else None
-        warn(f"第 {ref['order']} 篇需人工检查：{'最佳分数 ' + str(meta['score']) + ' 低于阈值' if meta and meta['score'] is not None else '未找到可靠 Crossref 结果'}。")
-    return refs
-
-
-def collection_name(prefix: str) -> str:
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d')}"
-
-
-def collection_key(resp: Any) -> str:
-    for value in ((resp or {}).get("successful") or {}).values():
-        data = value.get("data") or {}
-        if data.get("key"):
-            return data["key"]
-    raise FatalError("Collection 创建成功，但未解析到 collection key。")
-
-
-def build_item(ref: dict[str, Any], zot: zotero.Zotero, coll_key: str) -> dict[str, Any]:
-    item = zot.item_template("journalArticle")
-    title = ref["crossref_title"] or ref["title"]
-    item["title"] = f"{REVIEW_PREFIX}{title}" if ref["needs_review"] else title
-    item["creators"] = ref["crossref_authors"] or parse_authors(ref["author_raw"])
-    item["publicationTitle"] = ref["crossref_journal"] or ref["journal"]
-    item["date"] = ref["crossref_year"] or ref["year"]
-    item["DOI"] = ref["corrected_doi"] or ref["doi"]
-    item["collections"] = [coll_key]
-    item["extra"] = f"Import Order: {ref['order']}\nOriginal Entry Key: {ref['entry_key']}\nOriginal DOI: {ref['doi'] or '[empty]'}"
-    if ref["needs_review"]:
-        item["abstractNote"] = REVIEW_NOTE
-        item["extra"] += (
-            f"\nCrossref Status: needs manual review"
-            f"\nAI Title: {ref['title'] or '[empty]'}"
-            f"\nAI Author: {ref['author_raw'] or '[empty]'}"
-            f"\nAI Journal: {ref['journal'] or '[empty]'}"
-            f"\nAI Year: {ref['year'] or '[empty]'}"
-        )
-    return item
-
-
-def import_to_zotero(refs: list[dict[str, Any]], config: Config):
-    try:
-        zot = zotero.Zotero(config.zotero_library_id, config.zotero_library_type, config.zotero_api_key)
-    except Exception as exc:
-        raise FatalError(f"初始化 Zotero 客户端失败：{exc}") from exc
-    coll_name = collection_name(config.collection_prefix)
-    info(f"准备创建 Zotero Collection：{coll_name}")
-    try:
-        coll_resp = zot.create_collections([{"name": coll_name}])
-        coll_key = collection_key(coll_resp)
-    except Exception as exc:
-        raise FatalError(f"Collection 创建失败：{exc}") from exc
-    ok(f"Collection 创建成功：{coll_name} ({coll_key})")
-    stats = {"total": len(refs), "normal": 0, "review": 0, "failed": 0}
-    failed: list[str] = []
-    for ref in refs:
-        try:
-            resp = zot.create_items([build_item(ref, zot, coll_key)])
-            if not ((resp or {}).get("successful") or {}):
-                raise RuntimeError(f"返回结果中无 successful：{resp}")
-            stats["review" if ref["needs_review"] else "normal"] += 1
-            ok(f"第 {ref['order']} 篇已导入 Zotero。")
-        except Exception as exc:
-            stats["failed"] += 1
-            failed.append(f"#{ref['order']} {ref['title'] or '[无标题]'} -> {exc}")
-            warn(f"第 {ref['order']} 篇导入失败：{exc}")
-    return coll_name, stats, failed
-
-
-def print_summary(coll_name: str, stats: dict[str, int], failed: list[str]) -> None:
+def print_summary(collection_name: str, stats: dict[str, int], failures: list[str]) -> None:
     print()
-    info("导入汇总")
-    print(f"- Collection：{coll_name}")
+    print("[信息] 导入汇总")
+    print(f"- Collection：{collection_name}")
     print(f"- 总文献数：{stats['total']}")
     print(f"- 正常导入数：{stats['normal']}")
     print(f"- 降级导入数：{stats['review']}")
     print(f"- 完全失败数：{stats['failed']}")
-    if failed:
+    if failures:
         print("- 失败明细：")
-        for item in failed:
+        for item in failures:
             print(f"  - {item}")
     print()
     print("请在 Zotero 中打开本次新建的 Collection，并搜索 `⚠️` 快速定位需手动检查的条目。")
 
 
+def run_verification_mode() -> int:
+    config = load_verification_config()
+    pipeline = VerificationPipeline(config)
+    importer = ZoteroImporter(config)
+
+    print("[信息] 阶段 1/3：读取输入文件")
+    print("[信息] 阶段 2/3：校验与纠偏")
+    references = pipeline.run()
+    print("[信息] 阶段 3/3：导入 Zotero")
+    collection_name, stats, failures = importer.import_references(references)
+    print_summary(collection_name, stats, failures)
+    return 0
+
+
+def build_full_pipeline(verification_config: VerificationConfig, retrieval_config: RetrievalConfig) -> FullCitationPipeline:
+    query_builder = QueryBuilder()
+    retrieval_pipeline = RetrievalPipeline(SemanticScholarClient(retrieval_config))
+    verifier = CrossrefVerifier(verification_config)
+    review_logger = ReviewLogger(retrieval_config.review_log_path)
+    return FullCitationPipeline(query_builder, retrieval_pipeline, verifier, review_logger)
+
+
+def print_candidate_block(segment_id: str, claim_text: str, candidates) -> None:
+    print()
+    print(f"[信息] Segment: {segment_id}")
+    print(f"[信息] Claim: {claim_text}")
+    for index, candidate in enumerate(candidates[:5], start=1):
+        title = candidate.crossref_title or candidate.title
+        doi = candidate.corrected_doi or candidate.doi or "[no doi]"
+        status = candidate.recommendation_label
+        score = f"{candidate.ranking_score:.3f}"
+        matched = ", ".join(candidate.matched_terms[:5]) or "-"
+        print(f"{index}. [{status}] score={score} | {title} | {candidate.crossref_year or candidate.year} | {doi} | matched: {matched}")
+
+
+def append_feedback_if_present(feedback_logger: ReviewFeedbackLogger, segment_id: str, claim_text: str) -> None:
+    selected_rank_raw = os.getenv("SELECTED_RANK", "").strip()
+    selected_doi = os.getenv("SELECTED_DOI", "").strip()
+    selected_title = os.getenv("SELECTED_TITLE", "").strip()
+    action = os.getenv("REVIEW_ACTION", "").strip()
+    notes = os.getenv("REVIEW_NOTES", "").strip()
+
+    if not any([selected_rank_raw, selected_doi, selected_title, action, notes]):
+        return
+
+    selected_rank = int(selected_rank_raw) if selected_rank_raw else None
+    feedback_logger.append(
+        ReviewFeedbackRecord(
+            segment_id=segment_id,
+            claim_text=claim_text,
+            selected_rank=selected_rank,
+            selected_doi=selected_doi,
+            selected_title=selected_title,
+            action=action or "recorded",
+            notes=notes,
+        )
+    )
+
+
+def run_full_mode() -> int:
+    verification_config = load_verification_config()
+    retrieval_config = load_retrieval_config()
+    claim_text = os.getenv("CLAIM_TEXT", "").strip()
+    segment_id = os.getenv("SEGMENT_ID", "segment_001").strip() or "segment_001"
+    claims_file = os.getenv("CLAIMS_INPUT_PATH", "").strip()
+
+    pipeline = build_full_pipeline(verification_config, retrieval_config)
+    feedback_logger = ReviewFeedbackLogger(retrieval_config.review_feedback_path)
+
+    claims: list[tuple[str, str]] = []
+    if claims_file:
+        claims = load_claims_from_file(Path(claims_file))
+    elif claim_text:
+        claims = [(segment_id, claim_text)]
+    else:
+        raise FatalError("full 模式下必须提供 CLAIM_TEXT 或 CLAIMS_INPUT_PATH。")
+
+    print("[信息] 运行 full citation pipeline（批量版）")
+    for current_segment_id, current_claim_text in claims:
+        result = pipeline.run_claim(segment_id=current_segment_id, text=current_claim_text)
+        print(f"[信息] Query bundle: {result.query.all_queries}")
+        print(f"[信息] 检索候选数：{len(result.retrieval.candidates)}")
+        print(f"[信息] 已校验候选数：{len(result.verified_candidates)}")
+        print_candidate_block(current_segment_id, current_claim_text, result.verified_candidates)
+        append_feedback_if_present(feedback_logger, current_segment_id, current_claim_text)
+
+    print(f"\n[信息] review log 已写入：{retrieval_config.review_log_path}")
+    print(f"[信息] feedback log 已写入：{retrieval_config.review_feedback_path}")
+    return 0
+
+
 def main() -> int:
     try:
-        config = load_config()
-        info("阶段 1/3：读取输入文件")
-        refs = parse_refs(config.input_bib)
-        ok(f"成功读取 {len(refs)} 篇参考文献。")
-        info("阶段 2/3：校验与纠偏")
-        refs = validate_and_correct(refs, config)
-        info("阶段 3/3：导入 Zotero")
-        coll_name, stats, failed = import_to_zotero(refs, config)
-        print_summary(coll_name, stats, failed)
-        return 0
-    except FatalError as exc:
-        err(str(exc))
+        mode = os.getenv("PIPELINE_MODE", "verification").strip().lower() or "verification"
+        if mode == "verification":
+            return run_verification_mode()
+        if mode == "full":
+            return run_full_mode()
+        raise FatalError("PIPELINE_MODE 只能是 verification 或 full。")
+    except (FatalError, VerificationError, ZoteroImportError, FileNotFoundError, ValueError) as exc:
+        print(f"[错误] {exc}")
         return 1
     except KeyboardInterrupt:
-        err("用户中断执行。")
+        print("[错误] 用户中断执行。")
         return 130
     except Exception as exc:
-        err(f"未预期异常：{exc}")
+        print(f"[错误] 未预期异常：{exc}")
         return 1
 
 
