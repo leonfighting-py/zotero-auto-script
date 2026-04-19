@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: zotero-auto-script
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /
+    envVars:
+      - key: APP_ACCESS_PASSWORD
+        generateValue: true
+      - key: ZOTERO_LIBRARY_ID
+        sync: false
+      - key: ZOTERO_LIBRARY_TYPE
+        value: user
+      - key: ZOTERO_API_KEY
+        sync: false
+      - key: CROSSREF_MAILTO
+        sync: false
+      - key: REQUEST_DELAY_SECONDS
+        value: "0.3"
+      - key: CROSSREF_SCORE_THRESHOLD
+        value: "30"
+      - key: SEMANTIC_SCHOLAR_API_KEY
+        sync: false
+      - key: SEMANTIC_SCHOLAR_TOP_K
+        value: "10"

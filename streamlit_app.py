@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime
+import hmac
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,33 @@ def _init_env() -> None:
     # 允许从项目根目录或上层目录加载 .env
     load_dotenv()
     load_dotenv(dotenv_path=".env", override=True)
+
+
+def _require_access_password() -> None:
+    """
+    Optional lightweight access control for temporary public deployment.
+    If APP_ACCESS_PASSWORD is set, visitors must enter password first.
+    """
+    expected = os.getenv("APP_ACCESS_PASSWORD", "").strip()
+    if not expected:
+        return
+
+    if st.session_state.get("access_granted", False):
+        return
+
+    st.title("文献检索与 Zotero 工具")
+    st.warning("当前页面已开启访问密码，请先输入密码。")
+    with st.form("access_login_form", clear_on_submit=False):
+        provided = st.text_input("访问密码", type="password")
+        submitted = st.form_submit_button("进入系统")
+
+    if submitted:
+        if hmac.compare_digest(provided, expected):
+            st.session_state["access_granted"] = True
+            st.rerun()
+        st.error("密码错误，请重试。")
+
+    st.stop()
 
 
 def _split_citations(raw_text: str) -> list[str]:
@@ -877,6 +905,7 @@ def render_doi_zotero_tab() -> None:
 def main() -> None:
     st.set_page_config(page_title="文献检索与 Zotero 工具", page_icon="📚", layout="centered")
     _init_env()
+    _require_access_password()
     st.title("文献检索与 Zotero 工具")
     tab_doi, tab_query = st.tabs(["文献 DOI 与 Zotero", "Query 检索（Crossref）"])
     with tab_doi:
