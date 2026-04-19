@@ -26,14 +26,7 @@ class ZoteroImporter:
             raise ZoteroImportError(f"初始化 Zotero 客户端失败：{exc}") from exc
 
     def import_references(self, references: list[VerifiedReference]) -> tuple[str, dict[str, int], list[str]]:
-        collection_name = self._collection_name()
-        print(f"[信息] 准备创建 Zotero Collection：{collection_name}")
-        try:
-            response = self.client.create_collections([{"name": collection_name}])
-            collection_key = self._collection_key(response)
-        except Exception as exc:
-            raise ZoteroImportError(f"Collection 创建失败：{exc}") from exc
-
+        collection_name, collection_key = self.create_collection()
         print(f"[成功] Collection 创建成功：{collection_name} ({collection_key})")
         stats = {"total": len(references), "normal": 0, "review": 0, "failed": 0}
         failures: list[str] = []
@@ -49,6 +42,77 @@ class ZoteroImporter:
                 failures.append(f"#{reference.order} {reference.title or '[无标题]'} -> {exc}")
                 print(f"[警告] 第 {reference.order} 篇导入失败：{exc}")
         return collection_name, stats, failures
+
+    def create_collection(self, collection_name: str = "") -> tuple[str, str]:
+        target_name = (collection_name or "").strip() or self._collection_name()
+        print(f"[信息] 准备创建 Zotero Collection：{target_name}")
+        try:
+            response = self.client.create_collections([{"name": target_name}])
+            collection_key = self._collection_key(response)
+        except Exception as exc:
+            raise ZoteroImportError(f"Collection 创建失败：{exc}") from exc
+        return target_name, collection_key
+
+    def normalize_doi(self, doi: str) -> str:
+        value = (doi or "").strip()
+        if value.lower().startswith("https://doi.org/"):
+            value = value[16:]
+        if value.lower().startswith("http://doi.org/"):
+            value = value[15:]
+        return value.strip().lower()
+
+    def has_existing_doi(self, doi: str) -> bool:
+        normalized = self.normalize_doi(doi)
+        if not normalized:
+            return False
+        try:
+            candidates = self.client.items(q=normalized)
+        except Exception:
+            # 查询失败时不阻断主流程，交给后续导入返回结果处理。
+            return False
+
+        for candidate in candidates or []:
+            existing = self.normalize_doi((candidate.get("data") or {}).get("DOI", ""))
+            if existing == normalized:
+                return True
+        return False
+
+    def import_doi_entry(
+        self,
+        order: int,
+        parsed,
+        doi_result,
+        collection_key: str,
+        skip_existing: bool = True,
+    ) -> tuple[str, str]:
+        doi = self.normalize_doi(getattr(doi_result, "doi", ""))
+        if not doi:
+            return "missing_doi", ""
+        if skip_existing and self.has_existing_doi(doi):
+            return "skipped_duplicate", ""
+
+        item = self.client.item_template("journalArticle")
+        item["title"] = (getattr(doi_result, "title", "") or getattr(parsed, "title", "") or f"Reference {order}").strip()
+        item["creators"] = parse_authors(getattr(parsed, "author", ""))
+        item["publicationTitle"] = (getattr(doi_result, "journal", "") or getattr(parsed, "journal", "")).strip()
+        item["date"] = (getattr(doi_result, "year", "") or getattr(parsed, "year", "")).strip()
+        item["DOI"] = doi
+        item["url"] = f"https://doi.org/{doi}"
+        item["collections"] = [collection_key]
+        item["extra"] = (
+            "Import Source: streamlit_doi_lookup\n"
+            f"Import Order: {order}\n"
+            f"Crossref Score: {getattr(doi_result, 'score', '')}"
+        )
+
+        try:
+            response = self.client.create_items([item])
+            for value in ((response or {}).get("successful") or {}).values():
+                data = value.get("data") or {}
+                return "imported", str(data.get("key", ""))
+            raise ZoteroImportError(f"返回结果中无 successful：{response}")
+        except Exception as exc:
+            raise ZoteroImportError(f"DOI 条目导入失败：{exc}") from exc
 
     def _collection_name(self) -> str:
         return f"{self.config.collection_prefix}_{datetime.now().strftime('%Y%m%d')}"
