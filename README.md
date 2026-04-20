@@ -18,24 +18,6 @@
 - `verification`：校验已有 `BibTeX` 并导入 Zotero
 - `full`：输入单条或批量 claim，执行 query 构建、Semantic Scholar 检索、Crossref 校验、ranking，并记录 review log / feedback log
 
-## 0. 临时公网部署（先跑几天）
-
-如果你要快速上线做比赛集，推荐先用 Render（仓库里已提供 `Dockerfile` 和 `render.yaml`）。
-
-最小步骤：
-
-1. 把当前仓库推到 GitHub。
-2. 在 Render 里选择 **Blueprint**，指向该仓库。
-3. 按 `render.yaml` 自动创建服务。
-4. 在 Render 控制台补齐环境变量：
-   - 必填：`ZOTERO_LIBRARY_ID`、`ZOTERO_LIBRARY_TYPE`、`ZOTERO_API_KEY`、`CROSSREF_MAILTO`
-   - 建议：`SEMANTIC_SCHOLAR_API_KEY`
-5. 设置 `APP_ACCESS_PASSWORD`（已支持），避免公网裸奔。
-6. 部署完成后会得到公开 URL，可直接访问使用。
-
-说明：
-- 这是“先可用”的临时方案，适合先跑几天收集数据。
-- `APP_ACCESS_PASSWORD` 为空时不鉴权；设置后访问会先要求密码。
 
 ## 1. 环境准备
 

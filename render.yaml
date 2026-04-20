@@ -6,8 +6,8 @@ services:
     autoDeploy: false
     healthCheckPath: /
     envVars:
-      - key: APP_ACCESS_PASSWORD
-        generateValue: true
+      # 不在 Blueprint 里管理访问密码：若写 generateValue，每次同步可能重新生成，删控制台变量也会“长回来”。
+      # 需要密码时在 Render 控制台手动添加 APP_ACCESS_PASSWORD；不需要则不要设置该变量。
       - key: ZOTERO_LIBRARY_ID
         sync: false
       - key: ZOTERO_LIBRARY_TYPE

@@ -1,0 +1,11 @@
+# 避免本地/CI 构建时把 .env 打进镜像（load_dotenv 会读到残留密码）
+.env
+.env.*
+!.env.example
+__pycache__
+.git
+.gitignore
+*.pyc
+.pytest_cache
+outputs
+review_logs
