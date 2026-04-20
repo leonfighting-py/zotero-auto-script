@@ -1,7 +1,8 @@
 现可直接在以下链接中访问尝试👇
 https://zotero-auto-script.onrender.com
 
-若需导入到自己的ZOTERO文献库中，请按README中的步骤，部署到本地，填入自己的ZOTERO API KEY等系列参数。
+若需导入到自己的ZOTERO文献库中，请按README中的步骤，部署到本地。或是直接告诉AI这个github链接。
+填入自己的ZOTERO API KEY等系列参数。
 
 # Zotero / Citation Pipeline
 
