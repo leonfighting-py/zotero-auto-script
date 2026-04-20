@@ -1,3 +1,8 @@
+现可直接在以下链接中访问尝试👇
+https://zotero-auto-script.onrender.com
+
+若需导入到自己的ZOTERO文献库中，请按README中的步骤，部署到本地，填入自己的ZOTERO API KEY等系列参数。
+
 # Zotero / Citation Pipeline
 
 > 这个项目就是为了解决一个很现实的问题：毕业论文时间紧，引用处理太慢。  
@@ -115,96 +120,7 @@ CLAIMS_INPUT_PATH=claims.txt
 {"segment_id":"intro_001","claim_text":"Recent machine learning methods improve polymer property prediction under low-data settings."}
 ```
 
-## 7. ranking 现在怎么做
-
-当前是规则打分，不是 LLM rerank。
-
-综合信号包括：
-
-- verification 是否通过
-- Crossref 匹配分数
-- 标题关键词命中
-- citation count
-- 年份新近性
-
-输出标签包括：
-
-- `recommended`
-- `consider`
-- `needs_review`
-
-## 8. feedback log 怎么用
-
-如果你人工看完结果，想顺手记录“最终选了哪篇”，可以在运行前额外填写：
-
-- `SELECTED_RANK`
-- `SELECTED_DOI`
-- `SELECTED_TITLE`
-- `REVIEW_ACTION`
-- `REVIEW_NOTES`
-
-程序会把它写到：
-
-```text
-review_logs/full_pipeline_feedback.jsonl
-```
-
-这一步就是你后续在线评测集的雏形。
-
-## 9. 在线指标统计怎么跑
-
-项目里新增了：
-
-```text
-scripts/summarize_review_metrics.py
-```
-
-运行：
-
-```bash
-python scripts/summarize_review_metrics.py
-```
-
-它会读取：
-
-- `review_logs/full_pipeline_reviews.jsonl`
-- `review_logs/full_pipeline_feedback.jsonl`
-
-并输出：
-
-- `reviewed_segments`
-- `feedback_segments`
-- `empty_result_rate`
-- `avg_candidates_per_segment`
-- `verification_pass_rate`
-- `top1_verified_rate`
-- `top1_recommended_rate`
-- `candidate_acceptance_rate`
-- `top1_acceptance_rate`
-- `manual_override_rate`
-- `recommended_acceptance_rate`
-- `consider_acceptance_rate`
-- `recommendation_distribution`
-- `accepted_label_distribution`
-- `feedback_action_distribution`
-- `selected_rank_distribution`
-
-### 新增指标含义
-
-- `top1_verified_rate`：每个 segment 的 top1 候选中，有多少比例是通过 verification 的。
-- `top1_recommended_rate`：每个 segment 的 top1 候选中，有多少比例被系统打成 `recommended`。
-- `manual_override_rate`：有反馈的 segment 中，人工最终选择的不是 rank 1，而是更后面的候选的比例。
-- `recommended_acceptance_rate`：所有被系统标记为 `recommended` 的候选中，最终被人工选中的比例。
-- `consider_acceptance_rate`：所有被系统标记为 `consider` 的候选中，最终被人工选中的比例。
-
-这些指标能帮你判断：
-
-- top1 是不是已经足够可靠
-- ranking 是否真的有用
-- 人工是否经常推翻系统首选
-- `recommended` 标签是不是值得信任
-
-## 10. 当前文件召回方式到底是什么
+## 7. 当前文件召回方式到底是什么
 
 **现在不是 LLM 先深度语义理解再拆关键词。**
 
@@ -226,7 +142,7 @@ python scripts/summarize_review_metrics.py
 - 不是 embedding rerank
 - 也不是 agentic decomposition
 
-## 11. 当前限制
+## 8. 待V 0.2优化点
 
 - full 模式当前只接了 `Semantic Scholar`
 - 还没有接 `OpenScholar`
